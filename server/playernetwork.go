@@ -14,7 +14,10 @@ import (
 )
 
 const (
-	AckSize = 32
+	AckSize                   = 32
+	RttSmoothingFactor        = 0.0025
+	PacketLossSmoothingFactor = 0.10
+	BandwidthSmoothingFactor  = 0.10
 )
 
 type PlayerNetwork struct {
@@ -24,8 +27,17 @@ type PlayerNetwork struct {
 	remoteAckBitfield bitarray.Bitmap32
 	conn              net.PacketConn
 	rtt               atomic.Value
-	rttmap            hashmap.HashMap
-	ackqueue          hashmap.HashMap
+	packetloss        atomic.Value
+	sentpackets       hashmap.HashMap
+	ackbandwidth      atomic.Value
+	sentbandwidth     atomic.Value
+}
+
+type PacketAck struct {
+	Bytes    uint
+	SentTime time.Time
+	RecvTime time.Time
+	Acked    bool
 }
 
 func NewPlayerNetwork() *PlayerNetwork {
@@ -34,6 +46,9 @@ func NewPlayerNetwork() *PlayerNetwork {
 
 	pn.remoteSequence.Store(uint16(0))
 	pn.rtt.Store(float32(0))
+	pn.packetloss.Store(float32(0))
+	pn.ackbandwidth.Store(float32(0))
+	pn.sentbandwidth.Store(float32(0))
 
 	return &pn
 }
@@ -47,6 +62,17 @@ func (p *PlayerNetwork) RemoteSequence() uint16 {
 }
 func (p *PlayerNetwork) RTT() float32 {
 	return p.rtt.Load().(float32)
+}
+func (p *PlayerNetwork) SentBandwith() float32 {
+	return p.sentbandwidth.Load().(float32)
+}
+
+func (p *PlayerNetwork) AckBandwith() float32 {
+	return p.ackbandwidth.Load().(float32)
+}
+
+func (p *PlayerNetwork) PacketLoss() float32 {
+	return p.packetloss.Load().(float32)
 }
 
 func (p *PlayerNetwork) incrSeq() uint16 {
@@ -63,19 +89,17 @@ func (p *PlayerNetwork) getLocalSequence() uint16 {
 func (p *PlayerNetwork) ack(last uint16, bitmap uint32) {
 	now := time.Now()
 
-	p.ackqueue.Insert(last, now)
-
-	bmap := bitarray.Bitmap32(bitmap)
-
 	for i := 0; i < AckSize; i++ {
-		bitField := i + 1
-		seq := last - uint16(bitField)
+		ackSeq := last - uint16(i)
 
-		if bmap.GetBit(uint(bitField)) {
-			fmt.Println(6)
-			p.ackqueue.Insert(seq, now)
+		if val, ok := p.sentpackets.Get(ackSeq); ok {
+			pktack := val.(PacketAck)
+			pktack.Acked = true
+			pktack.RecvTime = now
+
+			p.sentpackets.Set(ackSeq, pktack)
+			p.impRTT(float32(pktack.RecvTime.Sub(pktack.SentTime) / time.Millisecond))
 		}
-
 	}
 }
 
@@ -86,17 +110,61 @@ func (p *PlayerNetwork) sendPacket() {
 	pkt.Ack = p.RemoteSequence()
 
 	pkt.AckBitfield = uint32(p.remoteAckBitfield)
+
 	// Sendpacket
 
 	// RTT calc process
-	p.rttmap.Set(sequence, time.Now())
+	p.sentpackets.Set(sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
 }
 
 func (p *PlayerNetwork) impRTT(newrtt float32) {
 
 	rtt := p.RTT()
-	rtt = rtt + (0.10 * (newrtt - rtt))
+	if (rtt == 0.0 && newrtt > 0.0) || math.Abs(float64(rtt-newrtt)) < 0.00001 {
+		rtt = newrtt
+	} else {
+		rtt += (newrtt - rtt) * RttSmoothingFactor
+	}
 	p.rtt.Store(rtt)
+}
+
+func (p *PlayerNetwork) updatePacketLoss(newpktloss float32) {
+
+	pktloss := p.PacketLoss()
+
+	if math.Abs(float64(pktloss-newpktloss)) > 0.00001 {
+		pktloss += (newpktloss - pktloss) * PacketLossSmoothingFactor
+	} else {
+		pktloss = newpktloss
+	}
+
+	p.packetloss.Store(pktloss)
+}
+
+func (p *PlayerNetwork) updateSentBandWidth(newbandwidth float32) {
+	bandwidth := p.SentBandwith()
+
+	if math.Abs(float64(bandwidth-newbandwidth)) > 0.00001 {
+		bandwidth += (newbandwidth - bandwidth) * BandwidthSmoothingFactor
+	} else {
+		bandwidth = newbandwidth
+	}
+
+	p.sentbandwidth.Store(bandwidth)
+
+}
+
+func (p *PlayerNetwork) updateAckBandWidth(newbandwidth float32) {
+	bandwidth := p.AckBandwith()
+
+	if math.Abs(float64(bandwidth-newbandwidth)) > 0.00001 {
+		bandwidth += (newbandwidth - bandwidth) * BandwidthSmoothingFactor
+	} else {
+		bandwidth = newbandwidth
+	}
+
+	p.ackbandwidth.Store(bandwidth)
+
 }
 
 func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP) {
@@ -135,26 +203,75 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP) {
 	}
 }
 
-func (p *PlayerNetwork) ackRTT() {
+func (p *PlayerNetwork) update() {
 
+	sendLen := p.sentpackets.Len()
+	if sendLen == 0 {
+		p.updatePacketLoss(0)
+		p.updateAckBandWidth(0)
+		p.updateSentBandWidth(0)
+		return
+	}
 	now := time.Now()
+	maxTime := time.Unix(1<<63-62135596801, 999999999)
 
-	for val := range p.rttmap.Iter() {
+	loss := 0
+	bytesSentACK := uint(0)
+	startTimeACK := maxTime
+	finishTimeACK := time.Time{}
 
-		sendTime := val.Value.(time.Time)
-		if income, ok := p.ackqueue.Get(val.Key); ok {
-			come := income.(time.Time)
+	bytesSentSent := uint(0)
+	startTimeSent := maxTime
+	finishTimeSent := time.Time{}
 
-			p.impRTT(float32(come.Sub(sendTime) / time.Millisecond))
-			p.rttmap.Del(val.Key)
-			p.ackqueue.Del(val.Key)
-			continue
+	for val := range p.sentpackets.Iter() {
+
+		pktack := val.Value.(PacketAck)
+
+		if !pktack.Acked && now.Sub(pktack.SentTime) > 1*time.Second {
+			loss++
+			p.sentpackets.Del(val.Key)
 		}
 
-		if now.Sub(sendTime) > 1*time.Second {
-			// Packet Loss
-			p.rttmap.Del(val.Key)
+		if pktack.Acked {
+			p.sentpackets.Del(val.Key)
+			bytesSentACK += pktack.Bytes
+			if pktack.SentTime.Before(startTimeACK) {
+				startTimeACK = pktack.SentTime
+			}
+
+			if pktack.SentTime.After(finishTimeACK) {
+				finishTimeACK = pktack.SentTime
+			}
 		}
+
+		bytesSentSent += pktack.Bytes
+		if pktack.SentTime.Before(startTimeSent) {
+			startTimeSent = pktack.SentTime
+		}
+
+		if pktack.SentTime.After(finishTimeSent) {
+			finishTimeSent = pktack.SentTime
+		}
+
+	}
+
+	pktLoss := (float32(loss) / float32(sendLen)) * 100.0
+	p.updatePacketLoss(pktLoss)
+
+	if !startTimeACK.Equal(maxTime) && !finishTimeACK.IsZero() {
+
+		t := finishTimeACK.Sub(startTimeACK).Nanoseconds()
+		newbandwidth := float32(float64(bytesSentACK) / (float64(t) * float64(time.Second/time.Nanosecond) * 8))
+
+		p.updateAckBandWidth(newbandwidth)
+	}
+
+	if !startTimeSent.Equal(maxTime) && !finishTimeSent.IsZero() {
+		t := finishTimeSent.Sub(startTimeSent).Nanoseconds()
+		newbandwidth := float32(float64(bytesSentSent) / (float64(t) * float64(time.Second/time.Nanosecond) * 8))
+
+		p.updateSentBandWidth(newbandwidth)
 	}
 
 }

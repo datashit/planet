@@ -1,39 +1,47 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
 func main() {
 
-	// pn := NewPlayerNetwork()
+	pn := NewPlayerNetwork()
 
-	// go func() {
-	// 	for {
-	// 		time.Sleep(100 * time.Millisecond)
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
 
-	// 		pn.ackRTT()
-	// 	}
+			pn.update()
+		}
 
-	// }()
+	}()
 
-	// for i := 0; i < 35; i++ {
-	// 	pn.sendPacket()
-	// }
+	for i := 0; i < 35; i++ {
+		pn.sendPacket()
+	}
 
-	// time.Sleep(100 * time.Millisecond)
+	time.Sleep(16 * time.Millisecond)
 
-	// for i := 0; i < 35; i++ {
-	// 	pkt := PacketUDP{Sequence: uint16(i + 1), Ack: uint16(i + 1)}
+	for i := 0; i < 1; i++ {
+		pkt := PacketUDP{Sequence: uint16(i + 1), Ack: uint16(i + 1)}
 
-	// 	pn.ReceivePacket(&pkt)
-	// }
+		pn.ReceivePacket(&pkt)
+	}
 
-	// time.Sleep(1 * time.Second)
-	// fmt.Println("rtt", pn.RTT())
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		fmt.Println("rtt", pn.RTT())
 
-	// return
+		fmt.Println("pktloss", pn.PacketLoss())
+		fmt.Println("ack bandwidth ", pn.AckBandwith())
+		fmt.Println("sent bandwidth", pn.SentBandwith())
+	}
+
+	return
 
 	lp, err := net.ListenPacket("udp", ":1433")
 	if err != nil {
