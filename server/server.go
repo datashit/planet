@@ -24,12 +24,19 @@ func main() {
 		pn.sendPacket()
 	}
 
-	time.Sleep(16 * time.Millisecond)
+	for i := 1; i < 20; i++ {
+		time.Sleep(16 * time.Millisecond)
+		if i == 3 {
+			continue
+		}
 
-	for i := 0; i < 1; i++ {
-		pkt := PacketUDP{Sequence: uint16(i + 1), Ack: uint16(i + 1)}
+		if i == 10 {
+			continue
+		}
+		now := time.Now()
+		pkt := PacketUDP{Sequence: uint16(i), Ack: uint16(i)}
 
-		pn.ReceivePacket(&pkt)
+		pn.ReceivePacket(&pkt, now)
 	}
 
 	for i := 0; i < 10; i++ {
@@ -37,8 +44,9 @@ func main() {
 		fmt.Println("rtt", pn.RTT())
 
 		fmt.Println("pktloss", pn.PacketLoss())
-		fmt.Println("ack bandwidth ", pn.AckBandwith())
-		fmt.Println("sent bandwidth", pn.SentBandwith())
+		fmt.Println("ack bandwidth ", pn.AckBandwidth())
+		fmt.Println("sent bandwidth", pn.SentBandwidth())
+		fmt.Println("recv bandwidth", pn.RecvBandwidth())
 	}
 
 	return
