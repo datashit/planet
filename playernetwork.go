@@ -1,4 +1,4 @@
-package main
+package planet
 
 import (
 	"math"
@@ -15,7 +15,7 @@ import (
 const (
 	AckSize                   = 32
 	RttSmoothingFactor        = 0.0025
-	PacketLossSmoothingFactor = 0.10
+	PacketLossSmoothingFactor = 0.20
 	BandwidthSmoothingFactor  = 0.10
 )
 
@@ -24,7 +24,6 @@ type PlayerNetwork struct {
 	localSequence     uint32
 	remoteSequence    atomic.Value
 	remoteAckBitfield bitarray.Bitmap32
-	conn              net.PacketConn
 	rtt               atomic.Value
 	packetloss        atomic.Value
 	sentpackets       hashmap.HashMap
@@ -51,6 +50,8 @@ func NewPlayerNetwork() *PlayerNetwork {
 	pn.ackbandwidth.Store(float32(0))
 	pn.sentbandwidth.Store(float32(0))
 	pn.recvbandwidth.Store(float32(0))
+
+	go pn.update()
 
 	return &pn
 }
@@ -98,28 +99,35 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 		ackSeq := last - uint16(i)
 
 		if val, ok := p.sentpackets.Get(ackSeq); ok {
-			pktack := val.(PacketAck)
-			pktack.Acked = true
-			pktack.RecvTime = now
 
-			p.sentpackets.Set(ackSeq, pktack)
-			p.impRTT(float32(pktack.RecvTime.Sub(pktack.SentTime) / time.Millisecond))
+			pktack := val.(PacketAck)
+			if !pktack.Acked {
+
+				pktack.Acked = true
+				pktack.RecvTime = now
+
+				p.sentpackets.Set(ackSeq, pktack)
+
+				p.impRTT(float32(pktack.RecvTime.Sub(pktack.SentTime) / time.Millisecond))
+			}
 		}
 	}
 }
 
-func (p *PlayerNetwork) sendPacket() {
+func (p *PlayerNetwork) SendPacket(protocol uint16, data []byte, write func(buf []byte)) {
 	sequence := p.incrSeq()
 
-	pkt := PacketUDP{Sequence: sequence}
+	pkt := PacketUDP{Sequence: sequence, Protocol: protocol, Data: data, DataSize: uint16(len(data))}
 	pkt.Ack = p.RemoteSequence()
 
 	pkt.AckBitfield = uint32(p.remoteAckBitfield)
 
 	// Sendpacket
-
+	write(pkt.Write())
 	// RTT calc process
+
 	p.sentpackets.Set(sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
+
 }
 
 func (p *PlayerNetwork) impRTT(newrtt float32) {
@@ -137,7 +145,7 @@ func (p *PlayerNetwork) updatePacketLoss(newpktloss float32) {
 
 	pktloss := p.PacketLoss()
 
-	if math.Abs(float64(pktloss-newpktloss)) > 0.00001 {
+	if math.Abs(float64(pktloss-newpktloss)) > 0.1 {
 		pktloss += (newpktloss - pktloss) * PacketLossSmoothingFactor
 	} else {
 		pktloss = newpktloss
@@ -149,7 +157,7 @@ func (p *PlayerNetwork) updatePacketLoss(newpktloss float32) {
 func (p *PlayerNetwork) updateRecvBandWidth(newbandwidth float32) {
 	bandwidth := p.RecvBandwidth()
 
-	if math.Abs(float64(bandwidth-newbandwidth)) > 0.00001 {
+	if math.Abs(float64(bandwidth-newbandwidth)) > 0.1 {
 		bandwidth += (newbandwidth - bandwidth) * BandwidthSmoothingFactor
 	} else {
 		bandwidth = newbandwidth
@@ -162,7 +170,7 @@ func (p *PlayerNetwork) updateRecvBandWidth(newbandwidth float32) {
 func (p *PlayerNetwork) updateSentBandWidth(newbandwidth float32) {
 	bandwidth := p.SentBandwidth()
 
-	if math.Abs(float64(bandwidth-newbandwidth)) > 0.00001 {
+	if math.Abs(float64(bandwidth-newbandwidth)) > 0.1 {
 		bandwidth += (newbandwidth - bandwidth) * BandwidthSmoothingFactor
 	} else {
 		bandwidth = newbandwidth
@@ -185,7 +193,7 @@ func (p *PlayerNetwork) updateAckBandWidth(newbandwidth float32) {
 
 }
 
-func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time) {
+func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time, addr *net.UDPAddr, process func(pkt *PacketUDP, addr *net.UDPAddr)) {
 
 	// Remote Ack
 	remoteSeq := p.RemoteSequence()
@@ -214,6 +222,7 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time) {
 	// }
 
 	// Packet Process
+	process(pkt, addr)
 	// Packet Process END
 
 	//Local Ack
@@ -234,7 +243,7 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 		p.updateSentBandWidth(0)
 		return
 	}
-	now := time.Now()
+
 	maxTime := time.Unix(1<<63-62135596801, 999999999)
 
 	loss := 0
@@ -246,11 +255,20 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 	startTimeSent := maxTime
 	finishTimeSent := time.Time{}
 
+	sendLen = 0
+
+	now := time.Now()
 	for val := range p.sentpackets.Iter() {
 
 		pktack := val.Value.(PacketAck)
 
-		if !pktack.Acked && now.Sub(pktack.SentTime) > 1*time.Second {
+		if now.Sub(pktack.SentTime) < 1*time.Second {
+			continue
+		}
+
+		sendLen++
+
+		if !pktack.Acked {
 			loss++
 			p.sentpackets.Del(val.Key)
 		}
@@ -283,15 +301,16 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 
 	if !startTimeACK.Equal(maxTime) && !finishTimeACK.IsZero() {
 
-		t := finishTimeACK.Sub(startTimeACK).Nanoseconds()
-		newbandwidth := float32(float64(bytesSentACK) / (float64(t) * float64(time.Second/time.Nanosecond) * 8))
+		t := finishTimeACK.Sub(startTimeACK).Seconds()
+		newbandwidth := float32(float64(bytesSentACK*8) / (float64(t) * 1000))
 
 		p.updateAckBandWidth(newbandwidth)
 	}
 
 	if !startTimeSent.Equal(maxTime) && !finishTimeSent.IsZero() {
-		t := finishTimeSent.Sub(startTimeSent).Nanoseconds()
-		newbandwidth := float32(float64(bytesSentSent) / (float64(t) * float64(time.Second/time.Nanosecond) * 8))
+		t := finishTimeSent.Sub(startTimeSent).Seconds()
+
+		newbandwidth := float32(float64(bytesSentSent*8) / (float64(t) * 1000))
 
 		p.updateSentBandWidth(newbandwidth)
 	}
@@ -323,21 +342,12 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 			finishTime = pktack.RecvTime
 		}
 
-		bytes += pktack.Bytes
-		if pktack.RecvTime.Before(startTime) {
-			startTime = pktack.RecvTime
-		}
-
-		if pktack.RecvTime.After(finishTime) {
-			finishTime = pktack.RecvTime
-		}
-
 	}
 
 	if !startTime.Equal(maxTime) && !finishTime.IsZero() {
-		t := finishTime.Sub(startTime).Nanoseconds()
-		newbandwidth := float32(float64(bytes) / (float64(t) * float64(time.Second/time.Nanosecond) * 8))
+		t := finishTime.Sub(startTime).Seconds()
 
+		newbandwidth := float32((float64(bytes) * 8) / (float64(t) * 1000))
 		p.updateRecvBandWidth(newbandwidth)
 	}
 
@@ -345,7 +355,11 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 
 func (p *PlayerNetwork) update() {
 
-	p.calculateSentAndPacketLoss()
-	p.calculateRecvBandWidth()
+	for {
+		time.Sleep(1 * time.Second)
+
+		p.calculateSentAndPacketLoss()
+		p.calculateRecvBandWidth()
+	}
 
 }
