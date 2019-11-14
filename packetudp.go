@@ -1,8 +1,10 @@
 package planet
 
-const DATA_SIZE_BYTES = 11
+const DATA_SIZE_BYTES = 14
+const PACKET_UDP_HEADER_BYTES = 17
 
 type PacketUDP struct {
+	Session     uint32
 	Protocol    uint16
 	Sequence    uint16
 	Ack         uint16
@@ -14,8 +16,9 @@ type PacketUDP struct {
 
 func (p *PacketUDP) Write() []byte {
 
-	buffer := NewBuffer(12 + int(p.DataSize))
+	buffer := NewBuffer(PACKET_UDP_HEADER_BYTES + int(p.DataSize))
 
+	buffer.WriteUint32(p.Session)
 	buffer.WriteUint16(p.Protocol)
 	buffer.WriteUint16(p.Sequence)
 	buffer.WriteUint16(p.Ack)
@@ -29,7 +32,7 @@ func (p *PacketUDP) Write() []byte {
 }
 
 func NewPacket(buf []byte) *PacketUDP {
-	if len(buf) < 12 {
+	if len(buf) < PACKET_UDP_HEADER_BYTES {
 		return nil
 	}
 
@@ -53,6 +56,11 @@ func NewPacket(buf []byte) *PacketUDP {
 	packetBuffer.Reset()
 
 	pckt := PacketUDP{DataSize: dataSize, Data: data}
+
+	pckt.Session, err = packetBuffer.GetUint32()
+	if err != nil {
+		return nil
+	}
 
 	pckt.Protocol, err = packetBuffer.GetUint16()
 	if err != nil {
