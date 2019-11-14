@@ -3,7 +3,6 @@ package planet
 import (
 	"math"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,7 +19,6 @@ const (
 )
 
 type PlayerNetwork struct {
-	sync.RWMutex
 	localSequence     uint32
 	remoteSequence    atomic.Value
 	remoteAckBitfield bitarray.Bitmap32
@@ -31,6 +29,7 @@ type PlayerNetwork struct {
 	ackbandwidth      atomic.Value
 	sentbandwidth     atomic.Value
 	recvbandwidth     atomic.Value
+	conn              *net.UDPConn
 }
 
 type PacketAck struct {
@@ -40,9 +39,9 @@ type PacketAck struct {
 	Acked    bool
 }
 
-func NewPlayerNetwork() *PlayerNetwork {
+func NewPlayerNetwork(conn *net.UDPConn) *PlayerNetwork {
 
-	pn := PlayerNetwork{}
+	pn := PlayerNetwork{conn: conn}
 
 	pn.remoteSequence.Store(uint16(0))
 	pn.rtt.Store(float32(0))
@@ -95,7 +94,13 @@ func (p *PlayerNetwork) getLocalSequence() uint16 {
 
 func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 
+	bifField := bitarray.Bitmap32(bitmap)
 	for i := 0; i < AckSize; i++ {
+
+		if !bifField.GetBit(uint(i)) {
+			continue
+		}
+
 		ackSeq := last - uint16(i)
 
 		if val, ok := p.sentpackets.Get(ackSeq); ok {
@@ -114,24 +119,43 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 	}
 }
 
-func (p *PlayerNetwork) SendPacket(protocol uint16, data []byte, write func(buf []byte)) {
+func (p *PlayerNetwork) generateSendPacket(protocol uint16, datatype uint8, data []byte) *PacketUDP {
 	sequence := p.incrSeq()
 
-	pkt := PacketUDP{Sequence: sequence, Protocol: protocol, Data: data, DataSize: uint16(len(data))}
+	pkt := PacketUDP{Sequence: sequence, Protocol: protocol, DataType: datatype, Data: data, DataSize: uint16(len(data))}
 	pkt.Ack = p.RemoteSequence()
 
 	pkt.AckBitfield = uint32(p.remoteAckBitfield)
 
-	// Sendpacket
-	write(pkt.Write())
-	// RTT calc process
+	return &pkt
+}
 
-	p.sentpackets.Set(sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
+func (p *PlayerNetwork) SendPacket(protocol uint16, datatype uint8, data []byte) error {
+
+	pkt := p.generateSendPacket(protocol, datatype, data)
+	// Sendpacket
+
+	_, err := p.conn.Write(pkt.Write())
+	if err == nil {
+		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
+	}
+	return err
+
+}
+
+func (p *PlayerNetwork) SendPacketToUDP(protocol uint16, datatype uint8, data []byte, addr *net.UDPAddr) error {
+	pkt := p.generateSendPacket(protocol, datatype, data)
+	// Sendpacket
+
+	_, err := p.conn.WriteToUDP(pkt.Write(), addr)
+	if err == nil {
+		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
+	}
+	return err
 
 }
 
 func (p *PlayerNetwork) impRTT(newrtt float32) {
-
 	rtt := p.RTT()
 	if (rtt == 0.0 && newrtt > 0.0) || math.Abs(float64(rtt-newrtt)) < 0.00001 {
 		rtt = newrtt
@@ -210,17 +234,6 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time, addr *
 	p.remoteAckBitfield = p.remoteAckBitfield.SetBit(setBitfield)
 	// Remote Ack END
 
-	// } else if (remoteSeq-AckSize) >= pkt.Sequence && pkt.Sequence <= remoteSeq {
-
-	// 	setBitfield := uint(remoteSeq - pkt.Sequence)
-	// 	if p.remoteAckBitfield.GetBit(setBitfield) {
-	// 		return // Duplicate Packet
-	// 	}
-	// 	p.remoteAckBitfield = p.remoteAckBitfield.SetBit(setBitfield)
-	// } else {
-	// 	invalidPacket = true
-	// }
-
 	// Packet Process
 	process(pkt, addr)
 	// Packet Process END
@@ -233,6 +246,7 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time, addr *
 	// if invalidPacket {
 	// 	return
 	// }
+
 }
 
 func (p *PlayerNetwork) calculateSentAndPacketLoss() {
@@ -309,7 +323,6 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 
 	if !startTimeSent.Equal(maxTime) && !finishTimeSent.IsZero() {
 		t := finishTimeSent.Sub(startTimeSent).Seconds()
-
 		newbandwidth := float32(float64(bytesSentSent*8) / (float64(t) * 1000))
 
 		p.updateSentBandWidth(newbandwidth)
@@ -354,7 +367,6 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 }
 
 func (p *PlayerNetwork) update() {
-
 	for {
 		time.Sleep(1 * time.Second)
 

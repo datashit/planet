@@ -1,12 +1,13 @@
 package planet
 
-const DATA_SIZE_BYTES = 10
+const DATA_SIZE_BYTES = 11
 
 type PacketUDP struct {
 	Protocol    uint16
 	Sequence    uint16
 	Ack         uint16
 	AckBitfield uint32
+	DataType    uint8
 	DataSize    uint16
 	Data        []byte
 }
@@ -19,6 +20,7 @@ func (p *PacketUDP) Write() []byte {
 	buffer.WriteUint16(p.Sequence)
 	buffer.WriteUint16(p.Ack)
 	buffer.WriteUint32(p.AckBitfield)
+	buffer.WriteUint8(p.DataType)
 	buffer.WriteUint16(p.DataSize)
 	buffer.WriteBytes(p.Data)
 
@@ -67,6 +69,10 @@ func NewPacket(buf []byte) *PacketUDP {
 		return nil
 	}
 	pckt.AckBitfield, err = packetBuffer.GetUint32()
+	if err != nil {
+		return nil
+	}
+	pckt.DataType, err = packetBuffer.GetUint8()
 	if err != nil {
 		return nil
 	}
