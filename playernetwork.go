@@ -19,7 +19,7 @@ const (
 )
 
 type PlayerNetwork struct {
-	localSequence     uint32
+	localSequence     atomic.Value
 	remoteSequence    atomic.Value
 	remoteAckBitfield bitarray.Bitmap32
 	rtt               atomic.Value
@@ -43,6 +43,7 @@ func NewPlayerNetwork(conn *net.UDPConn) *PlayerNetwork {
 
 	pn := PlayerNetwork{conn: conn}
 
+	pn.localSequence.Store(uint16(0))
 	pn.remoteSequence.Store(uint16(0))
 	pn.rtt.Store(float32(0))
 	pn.packetloss.Store(float32(0))
@@ -82,13 +83,14 @@ func (p *PlayerNetwork) PacketLoss() float32 {
 }
 
 func (p *PlayerNetwork) incrSeq() uint16 {
-
-	return uint16(atomic.AddUint32(&p.localSequence, 1))
+	newSeq := p.getLocalSequence() + 1
+	p.localSequence.Store(newSeq)
+	return newSeq
 }
 
 func (p *PlayerNetwork) getLocalSequence() uint16 {
 
-	return uint16(atomic.LoadUint32(&p.localSequence))
+	return p.localSequence.Load().(uint16)
 
 }
 
