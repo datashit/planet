@@ -30,6 +30,7 @@ type PlayerNetwork struct {
 	sentbandwidth     atomic.Value
 	recvbandwidth     atomic.Value
 	conn              *net.UDPConn
+	session           uint32
 }
 
 type PacketAck struct {
@@ -39,10 +40,11 @@ type PacketAck struct {
 	Acked    bool
 }
 
-func NewPlayerNetwork(conn *net.UDPConn) *PlayerNetwork {
+func NewPlayerNetwork(conn *net.UDPConn, session uint32) *PlayerNetwork {
 
 	pn := PlayerNetwork{conn: conn}
 
+	pn.session = session
 	pn.localSequence.Store(uint16(0))
 	pn.remoteSequence.Store(uint16(0))
 	pn.rtt.Store(float32(0))
@@ -124,7 +126,7 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 func (p *PlayerNetwork) generateSendPacket(protocol uint16, datatype uint8, data []byte) *PacketUDP {
 	sequence := p.incrSeq()
 
-	pkt := PacketUDP{Sequence: sequence, Protocol: protocol, DataType: datatype, Data: data, DataSize: uint16(len(data))}
+	pkt := PacketUDP{Session: session, Sequence: sequence, Protocol: protocol, DataType: datatype, Data: data, DataSize: uint16(len(data))}
 	pkt.Ack = p.RemoteSequence()
 
 	pkt.AckBitfield = uint32(p.remoteAckBitfield)
