@@ -30,6 +30,7 @@ type PlayerNetwork struct {
 	sentbandwidth     atomic.Value
 	recvbandwidth     atomic.Value
 	conn              *net.UDPConn
+	session           uint32
 }
 
 type PacketAck struct {
@@ -39,10 +40,11 @@ type PacketAck struct {
 	Acked    bool
 }
 
-func NewPlayerNetwork(conn *net.UDPConn) *PlayerNetwork {
+func NewPlayerNetwork(conn *net.UDPConn, session uint32) *PlayerNetwork {
 
 	pn := PlayerNetwork{conn: conn}
 
+	pn.session = session
 	pn.localSequence.Store(uint16(0))
 	pn.remoteSequence.Store(uint16(0))
 	pn.rtt.Store(float32(0))
