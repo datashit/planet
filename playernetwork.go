@@ -126,7 +126,7 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 func (p *PlayerNetwork) generateSendPacket(protocol uint16, datatype uint8, data []byte) *PacketUDP {
 	sequence := p.incrSeq()
 
-	pkt := PacketUDP{Session: session, Sequence: sequence, Protocol: protocol, DataType: datatype, Data: data, DataSize: uint16(len(data))}
+	pkt := PacketUDP{Session: p.session, Sequence: sequence, Protocol: protocol, DataType: datatype, Data: data, DataSize: uint16(len(data))}
 	pkt.Ack = p.RemoteSequence()
 
 	pkt.AckBitfield = uint32(p.remoteAckBitfield)
