@@ -1,6 +1,6 @@
 package planet
 
-const DATA_SIZE_BYTES = 14
+const DATA_SIZE_BYTES = 15
 const PACKET_UDP_HEADER_BYTES = 17
 
 type PacketUDP struct {
