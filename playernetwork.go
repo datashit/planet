@@ -234,8 +234,10 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time, addr *
 	p.setRemoteSequence(pkt.Sequence)
 
 	setBitfield := uint((pkt.Sequence - 1) - remoteSeq)
+	if setBitfield <= 32 {
+		p.remoteAckBitfield = p.remoteAckBitfield.SetBit(setBitfield)
+	}
 
-	p.remoteAckBitfield = p.remoteAckBitfield.SetBit(setBitfield)
 	// Remote Ack END
 
 	// Packet Process
