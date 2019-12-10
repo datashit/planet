@@ -25,12 +25,14 @@ type PlayerNetwork struct {
 	rtt               atomic.Value
 	packetloss        atomic.Value
 	sentpackets       hashmap.HashMap
+	reaiblepackets    hashmap.HashMap
 	recvpackets       hashmap.HashMap
 	ackbandwidth      atomic.Value
 	sentbandwidth     atomic.Value
 	recvbandwidth     atomic.Value
 	conn              *net.UDPConn
 	session           uint32
+	lastTime          time.Time
 }
 
 type PacketAck struct {
@@ -38,6 +40,7 @@ type PacketAck struct {
 	SentTime time.Time
 	RecvTime time.Time
 	Acked    bool
+	Reaible  bool
 }
 
 func NewPlayerNetwork(conn *net.UDPConn, session uint32) *PlayerNetwork {
@@ -52,8 +55,6 @@ func NewPlayerNetwork(conn *net.UDPConn, session uint32) *PlayerNetwork {
 	pn.ackbandwidth.Store(float32(0))
 	pn.sentbandwidth.Store(float32(0))
 	pn.recvbandwidth.Store(float32(0))
-
-	go pn.update()
 
 	return &pn
 }
@@ -118,6 +119,10 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 				p.sentpackets.Set(ackSeq, pktack)
 
 				p.impRTT(float32(pktack.RecvTime.Sub(pktack.SentTime) / time.Millisecond))
+
+				if pktack.Reaible {
+					p.reaiblepackets.Del(ackSeq)
+				}
 			}
 		}
 	}
@@ -134,26 +139,32 @@ func (p *PlayerNetwork) generateSendPacket(protocol uint16, datatype uint8, data
 	return &pkt
 }
 
-func (p *PlayerNetwork) SendPacket(protocol uint16, datatype uint8, data []byte) error {
+func (p *PlayerNetwork) SendPacket(protocol uint16, datatype uint8, data []byte, reaible bool) error {
 
 	pkt := p.generateSendPacket(protocol, datatype, data)
 	// Sendpacket
 
 	_, err := p.conn.Write(pkt.Write())
 	if err == nil {
-		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
+		if reaible {
+			p.reaiblepackets.Set(pkt.Sequence, pkt)
+		}
+		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
 	}
 	return err
 
 }
 
-func (p *PlayerNetwork) SendPacketToUDP(protocol uint16, datatype uint8, data []byte, addr *net.UDPAddr) error {
+func (p *PlayerNetwork) SendPacketToUDP(protocol uint16, datatype uint8, ack bool, data []byte, addr *net.UDPAddr, reaible bool) error {
 	pkt := p.generateSendPacket(protocol, datatype, data)
 	// Sendpacket
 
 	_, err := p.conn.WriteToUDP(pkt.Write(), addr)
 	if err == nil {
-		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize)})
+		if reaible {
+			p.reaiblepackets.Set(pkt.Sequence, pkt)
+		}
+		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
 	}
 	return err
 
@@ -372,12 +383,36 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 
 }
 
-func (p *PlayerNetwork) update() {
-	for {
-		time.Sleep(1 * time.Second)
+func (p *PlayerNetwork) update(now time.Time) {
 
-		p.calculateSentAndPacketLoss()
-		p.calculateRecvBandWidth()
+	for val := range p.reaiblepackets.Iter() {
+		pkt := val.Value.(*PacketUDP)
+
+		ackVal, ok := p.sentpackets.Get(pkt.Sequence)
+		if !ok {
+			continue
+		}
+
+		ack := ackVal.(PacketAck)
+
+		if ack.Acked {
+			p.reaiblepackets.Del(val.Key)
+			continue
+		}
+
+		if now.Sub(ack.SentTime) > (time.Millisecond * time.Duration(p.RTT()*1.25)) {
+			p.SendPacket(pkt.Protocol, pkt.DataType, pkt.Data, true)
+			p.reaiblepackets.Del(val.Key)
+		}
 	}
+
+	if now.Sub(p.lastTime) < (time.Second * 1) {
+		return
+	}
+
+	// 1 Second Update
+	p.calculateSentAndPacketLoss()
+	p.calculateRecvBandWidth()
+	p.lastTime = time.Now()
 
 }
