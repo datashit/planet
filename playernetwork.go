@@ -43,6 +43,11 @@ type PacketAck struct {
 	Reaible  bool
 }
 
+type ReaibleAck struct {
+	Packet *PacketUDP
+	Addr   *net.UDPAddr
+}
+
 func NewPlayerNetwork(conn *net.UDPConn, session uint32) *PlayerNetwork {
 
 	pn := PlayerNetwork{conn: conn}
@@ -147,7 +152,7 @@ func (p *PlayerNetwork) SendPacket(protocol uint16, datatype uint8, data []byte,
 	_, err := p.conn.Write(pkt.Write())
 	if err == nil {
 		if reaible {
-			p.reaiblepackets.Set(pkt.Sequence, pkt)
+			p.reaiblepackets.Set(pkt.Sequence, ReaibleAck{Packet: pkt})
 		}
 		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
 	}
@@ -155,14 +160,14 @@ func (p *PlayerNetwork) SendPacket(protocol uint16, datatype uint8, data []byte,
 
 }
 
-func (p *PlayerNetwork) SendPacketToUDP(protocol uint16, datatype uint8, ack bool, data []byte, addr *net.UDPAddr, reaible bool) error {
+func (p *PlayerNetwork) SendPacketToUDP(protocol uint16, datatype uint8, data []byte, addr *net.UDPAddr, reaible bool) error {
 	pkt := p.generateSendPacket(protocol, datatype, data)
 	// Sendpacket
 
 	_, err := p.conn.WriteToUDP(pkt.Write(), addr)
 	if err == nil {
 		if reaible {
-			p.reaiblepackets.Set(pkt.Sequence, pkt)
+			p.reaiblepackets.Set(pkt.Sequence, ReaibleAck{Packet: pkt, Addr: addr})
 		}
 		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
 	}
@@ -386,8 +391,8 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 func (p *PlayerNetwork) update(now time.Time) {
 
 	for val := range p.reaiblepackets.Iter() {
-		pkt := val.Value.(*PacketUDP)
-
+		rAck := val.Value.(ReaibleAck)
+		pkt := rAck.Packet
 		ackVal, ok := p.sentpackets.Get(pkt.Sequence)
 		if !ok {
 			continue
@@ -401,7 +406,11 @@ func (p *PlayerNetwork) update(now time.Time) {
 		}
 
 		if now.Sub(ack.SentTime) > (time.Millisecond * time.Duration(p.RTT()*1.25)) {
-			p.SendPacket(pkt.Protocol, pkt.DataType, pkt.Data, true)
+			if rAck.Addr != nil {
+				p.SendPacketToUDP(pkt.Protocol, pkt.DataType, pkt.Data, rAck.Addr, true)
+			} else {
+				p.SendPacket(pkt.Protocol, pkt.DataType, pkt.Data, true)
+			}
 			p.reaiblepackets.Del(val.Key)
 		}
 	}
