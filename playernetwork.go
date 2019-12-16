@@ -3,12 +3,12 @@ package planet
 import (
 	"math"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Workiva/go-datastructures/bitarray"
 	_ "github.com/Workiva/go-datastructures/bitarray"
-	"github.com/cornelk/hashmap"
 )
 
 const (
@@ -24,9 +24,9 @@ type PlayerNetwork struct {
 	remoteAckBitfield bitarray.Bitmap32
 	rtt               atomic.Value
 	packetloss        atomic.Value
-	sentpackets       hashmap.HashMap
-	reaiblepackets    hashmap.HashMap
-	recvpackets       hashmap.HashMap
+	sentpackets       sync.Map
+	reaiblepackets    sync.Map
+	recvpackets       sync.Map
 	ackbandwidth      atomic.Value
 	sentbandwidth     atomic.Value
 	recvbandwidth     atomic.Value
@@ -113,7 +113,7 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 
 		ackSeq := last - uint16(i)
 
-		if val, ok := p.sentpackets.Get(ackSeq); ok {
+		if val, ok := p.sentpackets.Load(ackSeq); ok {
 
 			pktack := val.(PacketAck)
 			if !pktack.Acked {
@@ -121,12 +121,12 @@ func (p *PlayerNetwork) ack(last uint16, bitmap uint32, now time.Time) {
 				pktack.Acked = true
 				pktack.RecvTime = now
 
-				p.sentpackets.Set(ackSeq, pktack)
+				p.sentpackets.Store(ackSeq, pktack)
 
 				p.impRTT(float32(pktack.RecvTime.Sub(pktack.SentTime) / time.Millisecond))
 
 				if pktack.Reaible {
-					p.reaiblepackets.Del(ackSeq)
+					p.reaiblepackets.Delete(ackSeq)
 				}
 			}
 		}
@@ -152,9 +152,9 @@ func (p *PlayerNetwork) SendPacket(protocol uint16, datatype uint8, data []byte,
 	_, err := p.conn.Write(pkt.Write())
 	if err == nil {
 		if reaible {
-			p.reaiblepackets.Set(pkt.Sequence, ReaibleAck{Packet: pkt})
+			p.reaiblepackets.Store(pkt.Sequence, ReaibleAck{Packet: pkt})
 		}
-		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
+		p.sentpackets.Store(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
 	}
 	return err
 
@@ -167,9 +167,9 @@ func (p *PlayerNetwork) SendPacketToUDP(protocol uint16, datatype uint8, data []
 	_, err := p.conn.WriteToUDP(pkt.Write(), addr)
 	if err == nil {
 		if reaible {
-			p.reaiblepackets.Set(pkt.Sequence, ReaibleAck{Packet: pkt, Addr: addr})
+			p.reaiblepackets.Store(pkt.Sequence, ReaibleAck{Packet: pkt, Addr: addr})
 		}
-		p.sentpackets.Set(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
+		p.sentpackets.Store(pkt.Sequence, PacketAck{SentTime: time.Now(), Bytes: uint(12 + pkt.DataSize), Reaible: reaible})
 	}
 	return err
 
@@ -264,7 +264,7 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time, addr *
 	p.ack(pkt.Ack, pkt.AckBitfield, recvTime)
 	//Local Ack END
 
-	p.recvpackets.Set(pkt.Sequence, PacketAck{RecvTime: recvTime, Bytes: uint(12 + pkt.DataSize)})
+	p.recvpackets.Store(pkt.Sequence, PacketAck{RecvTime: recvTime, Bytes: uint(12 + pkt.DataSize)})
 	// if invalidPacket {
 	// 	return
 	// }
@@ -272,13 +272,6 @@ func (p *PlayerNetwork) ReceivePacket(pkt *PacketUDP, recvTime time.Time, addr *
 }
 
 func (p *PlayerNetwork) calculateSentAndPacketLoss() {
-	sendLen := p.sentpackets.Len()
-	if sendLen == 0 {
-		p.updatePacketLoss(0)
-		p.updateAckBandWidth(0)
-		p.updateSentBandWidth(0)
-		return
-	}
 
 	maxTime := time.Unix(1<<63-62135596801, 999999999)
 
@@ -291,26 +284,26 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 	startTimeSent := maxTime
 	finishTimeSent := time.Time{}
 
-	sendLen = 0
+	sendLen := 0
 
 	now := time.Now()
-	for val := range p.sentpackets.Iter() {
 
-		pktack := val.Value.(PacketAck)
+	p.sentpackets.Range(func(key, value interface{}) bool {
+		pktack := value.(PacketAck)
 
 		if now.Sub(pktack.SentTime) < 1*time.Second {
-			continue
+			return true
 		}
 
 		sendLen++
 
 		if !pktack.Acked {
 			loss++
-			p.sentpackets.Del(val.Key)
+			p.sentpackets.Delete(key)
 		}
 
 		if pktack.Acked {
-			p.sentpackets.Del(val.Key)
+			p.sentpackets.Delete(key)
 			bytesSentACK += pktack.Bytes
 			if pktack.SentTime.Before(startTimeACK) {
 				startTimeACK = pktack.SentTime
@@ -330,6 +323,14 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 			finishTimeSent = pktack.SentTime
 		}
 
+		return true
+	})
+
+	if sendLen == 0 {
+		p.updatePacketLoss(0)
+		p.updateAckBandWidth(0)
+		p.updateSentBandWidth(0)
+		return
 	}
 
 	pktLoss := (float32(loss) / float32(sendLen)) * 100.0
@@ -353,21 +354,18 @@ func (p *PlayerNetwork) calculateSentAndPacketLoss() {
 
 func (p *PlayerNetwork) calculateRecvBandWidth() {
 
-	recvLen := p.recvpackets.Len()
-	if recvLen == 0 {
-		p.updateRecvBandWidth(0)
-		return
-	}
+	recvLen := 0
+
 	maxTime := time.Unix(1<<63-62135596801, 999999999)
 	bytes := uint(0)
 	startTime := maxTime
 	finishTime := time.Time{}
 
-	for val := range p.recvpackets.Iter() {
+	p.recvpackets.Range(func(key, value interface{}) bool {
 
-		pktack := val.Value.(PacketAck)
+		pktack := value.(PacketAck)
 
-		p.recvpackets.Del(val.Key)
+		p.recvpackets.Delete(key)
 		bytes += pktack.Bytes
 		if pktack.RecvTime.Before(startTime) {
 			startTime = pktack.RecvTime
@@ -376,7 +374,13 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 		if pktack.RecvTime.After(finishTime) {
 			finishTime = pktack.RecvTime
 		}
+		recvLen++
+		return true
+	})
 
+	if recvLen == 0 {
+		p.updateRecvBandWidth(0)
+		return
 	}
 
 	if !startTime.Equal(maxTime) && !finishTime.IsZero() {
@@ -388,34 +392,48 @@ func (p *PlayerNetwork) calculateRecvBandWidth() {
 
 }
 
-func (p *PlayerNetwork) update(now time.Time) {
+func (p *PlayerNetwork) Update(now time.Time) {
 
-	for val := range p.reaiblepackets.Iter() {
-		rAck := val.Value.(ReaibleAck)
-		pkt := rAck.Packet
-		ackVal, ok := p.sentpackets.Get(pkt.Sequence)
-		if !ok {
-			continue
-		}
-
-		ack := ackVal.(PacketAck)
-
-		if ack.Acked {
-			p.reaiblepackets.Del(val.Key)
-			continue
-		}
-
-		if now.Sub(ack.SentTime) > (time.Millisecond * time.Duration(p.RTT()*1.25)) {
-			if rAck.Addr != nil {
-				p.SendPacketToUDP(pkt.Protocol, pkt.DataType, pkt.Data, rAck.Addr, true)
-			} else {
-				p.SendPacket(pkt.Protocol, pkt.DataType, pkt.Data, true)
-			}
-			p.reaiblepackets.Del(val.Key)
-		}
+	rtt := p.RTT()
+	if rtt == 0 {
+		rtt = 200
 	}
 
-	if now.Sub(p.lastTime) < (time.Second * 1) {
+	pktLoss := p.PacketLoss()
+
+	if pktLoss < 90.0 {
+		duration := time.Millisecond * time.Duration(rtt*(1.25+(pktLoss/100)))
+
+		p.reaiblepackets.Range(func(key, value interface{}) bool {
+
+			rAck := value.(ReaibleAck)
+			pkt := rAck.Packet
+			ackVal, ok := p.sentpackets.Load(pkt.Sequence)
+			if !ok {
+				return true
+			}
+
+			ack := ackVal.(PacketAck)
+
+			if ack.Acked {
+				p.reaiblepackets.Delete(key)
+				return true
+			}
+
+			if now.Sub(ack.SentTime) > duration {
+				if rAck.Addr != nil {
+					p.SendPacketToUDP(pkt.Protocol, pkt.DataType, pkt.Data, rAck.Addr, true)
+				} else {
+					p.SendPacket(pkt.Protocol, pkt.DataType, pkt.Data, true)
+				}
+				p.reaiblepackets.Delete(key)
+			}
+			return true
+		})
+
+	}
+
+	if now.Sub(p.lastTime) < (time.Millisecond * 1001) {
 		return
 	}
 
