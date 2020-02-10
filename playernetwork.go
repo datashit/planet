@@ -14,7 +14,7 @@ import (
 const (
 	AckSize                   = 32
 	RttSmoothingFactor        = 0.0025
-	PacketLossSmoothingFactor = 0.20
+	PacketLossSmoothingFactor = 0.50
 	BandwidthSmoothingFactor  = 0.10
 )
 
